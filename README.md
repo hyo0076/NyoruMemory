@@ -1,0 +1,55 @@
+# NyoruMemory
+
+RisuAI의 대화를 **내용·대사 / 사실 / 관계 / 줄거리**로 정리하고, 다음 답변에 필요한 기억을 찾아 넣는 장기기억 플러그인입니다.
+
+**현재 배포 버전: 0.25.1**
+
+## 다운로드 및 설치
+
+**[NyoruMemory.js 다운로드](https://raw.githubusercontent.com/hyo0076/NyoruMemory/main/NyoruMemory.js)**
+
+1. 위 링크의 파일을 `NyoruMemory.js`로 저장합니다.
+2. RisuAI의 플러그인 설정에서 파일을 불러옵니다. API 3.0 플러그인을 지원하는 RisuAI가 필요합니다.
+3. 채팅 입력창 오른쪽 삼선 메뉴에서 **뇨루기억**을 엽니다.
+4. **모델 및 설정**에서 사용할 API와 모델을 연결합니다.
+5. RisuAI 프롬프트의 장기기억 항목을 **순수 프롬프트**로 변경하고, 아래 내용을 넣습니다.
+
+```text
+[NyoruMemory.memory]
+```
+
+기억 정리용 모델은 이 플러그인에서 직접 설정합니다. RisuAI의 메인·보조 모델이나 Provider Manager를 가져오지 않습니다. Gemini의 Vertex AI는 **서비스 계정 JSON**으로도 연결할 수 있습니다. [Vertex AI 설정 안내](Vertex-AI.md)
+
+## 업데이트
+
+0.25.1부터 GitHub 업데이트 주소가 포함됩니다. 이전 버전 사용자는 이번 파일을 한 번 직접 설치하세요. 이후에는 RisuAI의 플러그인 업데이트 확인 기능으로 새 버전을 받을 수 있습니다.
+
+```js
+//@display-name NyoruMemory v0.25.1
+//@version 0.25.1
+//@update-url https://raw.githubusercontent.com/hyo0076/NyoruMemory/main/NyoruMemory.js
+```
+
+기존 기억·설정과의 호환을 위해 내부 식별자는 `longmemory`를 유지합니다. 이전 `[LongMemory.memory]` 슬롯도 호환됩니다.
+
+## 주요 기능
+
+- 내용과 대사를 함께 보관하고, 사실·관계·줄거리를 구분해 관리합니다.
+- 저장된 기억을 검색해 프롬프트에 주입하며, 별도로 연결한 임베딩 모델을 사용할 수 있습니다.
+- 로어북으로 관계도를 만들고, 대화로 기억을 검수하거나 항목별로 수정·삭제할 수 있습니다.
+- 사실과 관계는 사용을 끄면 추출·갱신·검색·주입을 중지하고 기존 기록을 보관합니다.
+- 기억 백업과 복원을 지원합니다. 업데이트 전에는 중요한 기억을 백업해 두세요.
+
+## 변경 내용
+
+**0.25.1** — GitHub 업데이트 주소 추가. 기억 처리 방식과 저장 식별자는 유지합니다.
+
+**0.25.0** — Google Vertex AI 서비스 계정 JSON 연결, 인증 토큰 갱신, 별도 검수 모델의 Vertex 연결을 추가했습니다.
+
+## Special Thanks
+
+- [HypaPlus v1.0.9](https://arca.live/b/characterai/180803492): 간결하고 편리한 장기기억 시스템에서 아이디어와 영감을 얻었습니다.
+- [Yumi Translator v1.4.3](https://update.rsyumi.workers.dev/yumi-translator): 로어북에서 자료를 추출해 활용하는 방식에서 관계 시스템과 상태 갱신의 영감을 얻었습니다.
+- [Yumi Provider Manager](https://arca.live/b/characterai/181020664): API 호출과 모델 연결 설정을 구성하는 방식을 참고했습니다.
+
+이 저장소는 설치용 파일의 공식 배포·업데이트 저장소입니다. 포함된 외부 구성요소의 저작권 및 라이선스는 [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt)를 참고하세요.
