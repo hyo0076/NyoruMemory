@@ -1,6 +1,6 @@
 //@name longmemory
-//@display-name NyoruMemory v0.25.1
-//@version 0.25.1
+//@display-name NyoruMemory v0.26.0
+//@version 0.26.0
 //@update-url https://raw.githubusercontent.com/hyo0076/NyoruMemory/main/NyoruMemory.js
 //@api 3.0
 (async () => {
@@ -3548,6 +3548,240 @@ class ContextBridge {
 
 return { RisuHost, ContextBridge };
 })();
+__modules["update-notes.js"] = (() => {
+// Public release feed and offline change log. Keep this independent of memory data.
+const VERSION = '0.26.0';
+const UPDATE_NOTES = {
+  latest: VERSION,
+  entries: [
+    { version: VERSION, date: '2026-10-06', title: '업데이트 알림과 변경 내역', changes: [
+      '새 버전을 설치한 뒤 기억 보관함을 처음 열면 변경 내용을 보여줍니다.',
+      '새 공개 버전이 있으면 내용 보기 알림을 표시하고, 창 하단에서 지난 업데이트 내역도 확인할 수 있습니다.',
+      '자동 버전 확인을 켜고 끌 수 있습니다. 최대 6시간에 한 번 확인하며, 플러그인 설치는 직접 선택합니다.',
+      '인터넷 연결이 없어도 설치된 버전의 변경 내역을 볼 수 있습니다.'
+    ], note: 'RisuAI 설정 → 플러그인에서 NyoruMemory를 업데이트한 뒤 새로 고침하세요. 기존 기억과 설정을 계속 사용합니다.' },
+    { version: '0.25.1', date: '2026-09-28', title: 'GitHub 업데이트 연결', changes: ['고정 업데이트 주소를 추가해 RisuAI의 플러그인 업데이트 기능으로 새 파일을 받을 수 있습니다.'] },
+    { version: '0.25.0', date: '2026-09-28', title: 'Google Vertex AI 연결', changes: ['서비스 계정 JSON으로 Vertex AI 모델을 연결할 수 있습니다.', '기억 정리 모델과 별도 검수 모델에 각각 설정할 수 있습니다.'] },
+    { version: '0.24.5', date: '2026-09-28', title: '관계 확인 개선', changes: ['안전하게 합칠 수 있는 인물별 중복 인식을 정리하고, 관계와 무관한 행동 서술을 줄였습니다.'] },
+    { version: '0.24.4', date: '2026-09-23', title: '기억 슬롯 이름 변경', changes: ['기본 슬롯을 [NyoruMemory.memory]로 변경했습니다. 이전 LongMemory 슬롯도 호환됩니다.'] },
+    { version: '0.24.3', date: '2026-09-23', title: '채팅 메뉴로 이동', changes: ['채팅 입력창 오른쪽 삼선 메뉴의 뇨루기억에서 관리 화면을 열 수 있습니다.'] },
+    { version: '0.24.0', date: '2026-09-22', title: '팩트·관계 사용 중지', changes: ['팩트와 관계의 추출·갱신·검색·주입을 각각 끄고 켤 수 있습니다.', '설정 화면의 배경 블러를 제거했습니다.'] }
+  ]
+};
+
+return { VERSION, UPDATE_NOTES };
+})();
+__modules["update-notices.js"] = (() => {
+const { VERSION, UPDATE_NOTES } = __modules["update-notes.js"];
+const bundled=UPDATE_NOTES;
+const KEY='longmemory:v1:update-notices';
+const MANIFEST_URL='https://raw.githubusercontent.com/hyo0076/NyoruMemory/main/updates.json';
+const CHECK_INTERVAL=6*60*60*1000;
+const validVersion=value=>typeof value==='string'&&/^\d{1,6}\.\d{1,6}\.\d{1,6}$/.test(value);
+function compare(a,b) {
+  const left=a.split('.').map(Number),right=b.split('.').map(Number);
+  for(let i=0;i<3;i++)if(left[i]!==right[i])return left[i]>right[i]?1:-1;
+  return 0;
+}
+function manifest(value) {
+  if(!value||!validVersion(value.latest)||!Array.isArray(value.entries))throw new Error('업데이트 안내 형식을 읽을 수 없습니다.');
+  const entries=[],seen=new Set();
+  for(const entry of value.entries.slice(0,40)) {
+    if(!entry||!validVersion(entry.version)||seen.has(entry.version)||compare(entry.version,value.latest)>0||!Array.isArray(entry.changes))continue;
+    const text=value=>typeof value==='string'?value.slice(0,1200):'';
+    entries.push({version:entry.version,date:text(entry.date).slice(0,20),title:text(entry.title).slice(0,160),changes:entry.changes.filter(line=>typeof line==='string').slice(0,20).map(text),note:text(entry.note)});
+    seen.add(entry.version);
+  }
+  if(!seen.has(value.latest))throw new Error('최신 버전의 변경 내역이 없습니다.');
+  return {latest:value.latest,entries:entries.sort((a,b)=>compare(b.version,a.version))};
+}
+class UpdateNotices {
+  constructor(app) {
+    this.app=app;this.state={autoCheck:true,seenVersion:null,dismissedVersion:null,checkedAt:0,attemptedAt:0,remote:null};
+    this.status='idle';this.error='';this.saveError='';this.saveQueue=Promise.resolve();this.disposed=false;
+  }
+  get available(){return !!this.state.remote&&compare(this.state.remote.latest,VERSION)>0;}
+  get unseenInstalled(){return !this.state.seenVersion||compare(VERSION,this.state.seenVersion)>0;}
+  get unreadRemote(){return this.available&&(!this.state.dismissedVersion||compare(this.state.remote.latest,this.state.dismissedVersion)>0);}
+  get entries() {
+    const rows=new Map(bundled.entries.map(row=>[row.version,row]));
+    for(const row of this.state.remote?.entries||[])if(!rows.has(row.version))rows.set(row.version,row);
+    return [...rows.values()].sort((a,b)=>compare(b.version,a.version));
+  }
+  emit(){if(!this.disposed)this.onChange?.();}
+  load() {
+    if(!this.loading)this.loading=(async()=>{
+      try {
+        const saved=await this.app.api.pluginStorage.getItem(KEY);
+        if(saved&&typeof saved==='object') {
+          this.state.autoCheck=saved.autoCheck!==false;
+          for(const field of ['seenVersion','dismissedVersion'])if(validVersion(saved[field]))this.state[field]=saved[field];
+          for(const field of ['checkedAt','attemptedAt'])if(Number.isFinite(saved[field])&&saved[field]>0&&saved[field]<=Date.now())this.state[field]=saved[field];
+          try{if(saved.remote)this.state.remote=manifest(saved.remote);}catch{}
+        }
+      }catch{this.saveError='알림 설정을 불러오지 못했습니다. 이번 실행에서는 기본 설정을 사용합니다.';}
+      this.emit();
+    })();
+    return this.loading;
+  }
+  async save() {
+    const snapshot=JSON.parse(JSON.stringify(this.state));
+    const pending=this.saveQueue.then(()=>this.app.api.pluginStorage.setItem(KEY,snapshot));
+    this.saveQueue=pending.catch(()=>{});
+    try{await pending;this.saveError='';}catch{this.saveError='알림 확인 기록을 저장하지 못했습니다. 다음 실행에서 다시 표시될 수 있습니다.';}
+    this.emit();
+  }
+  async setAutoCheck(enabled){await this.load();this.state.autoCheck=!!enabled;await this.save();}
+  async acknowledge(latest) {
+    await this.load();
+    if(!this.state.seenVersion||compare(VERSION,this.state.seenVersion)>0)this.state.seenVersion=VERSION;
+    if(validVersion(latest)&&(!this.state.dismissedVersion||compare(latest,this.state.dismissedVersion)>0))this.state.dismissedVersion=latest;
+    await this.save();
+  }
+  async check({force=false}={}) {
+    await this.load();
+    if(this.disposed)return;
+    if(this.pending)return this.pending;
+    if(!force&&(!this.state.autoCheck||Date.now()-Math.max(this.state.checkedAt,this.state.attemptedAt)<CHECK_INTERVAL))return;
+    this.pending=this.fetchManifest().finally(()=>{this.pending=null;});
+    return this.pending;
+  }
+  async fetchManifest() {
+    this.status='checking';this.error='';this.state.attemptedAt=Date.now();this.emit();
+    const controller=new AbortController();this.controller=controller;
+    let timeout,onAbort;
+    const cancelled=new Promise((resolve,reject)=>{
+      onAbort=()=>reject(new Error('버전 확인 응답을 받지 못했습니다. 나중에 다시 확인하세요.'));
+      controller.signal.addEventListener('abort',onAbort,{once:true});
+      // This limit applies only to the public release feed, never to MCP or AI.
+      timeout=setTimeout(()=>controller.abort(),12000);
+    });
+    try {
+      const fetcher=typeof this.app.api.nativeFetch==='function'?this.app.api.nativeFetch.bind(this.app.api):globalThis.fetch.bind(globalThis);
+      const read=(async()=>{
+        const response=await fetcher(MANIFEST_URL,{method:'GET',credentials:'omit',cache:'no-store',signal:controller.signal});
+        if(!response.ok)throw new Error('업데이트 안내를 가져오지 못했습니다. (HTTP '+response.status+')');
+        const text=await response.text();
+        if(text.length>128000)throw new Error('업데이트 안내가 너무 큽니다.');
+        let value;try{value=JSON.parse(text);}catch{throw new Error('업데이트 안내를 읽을 수 없습니다.');}
+        return manifest(value);
+      })();
+      const remote=await Promise.race([read,cancelled]);
+      if(this.disposed||controller.signal.aborted)return;
+      this.state.remote=remote;this.state.checkedAt=Date.now();this.status='checked';
+      await this.save();
+    }catch(error){if(!this.disposed){this.status='error';this.error=error.message?.startsWith('업데이트')||controller.signal.aborted?error.message:'GitHub에 연결하지 못했습니다. 저장된 변경 내역은 계속 볼 수 있습니다.';await this.save();}}
+    finally{clearTimeout(timeout);controller.signal.removeEventListener('abort',onAbort);if(this.controller===controller)this.controller=null;this.emit();}
+  }
+  dispose(){this.disposed=true;this.controller?.abort();this.onChange=null;}
+}
+
+
+return { compare, manifest, UpdateNotices };
+})();
+__modules["update-ui.js"] = (() => {
+const { VERSION } = __modules["update-notes.js"];
+const { compare } = __modules["update-notices.js"];
+const e=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const act=(ui,fn)=>Promise.resolve().then(fn).catch(error=>ui.note(error.message));
+function updateFooter(ui) {
+  const badge=ui.updates.unreadRemote?'새 버전':ui.updates.unseenInstalled?'새 소식':'';
+  return '<button type="button" class="subtle update-link" data-update-open>NyoruMemory · v'+e(VERSION)+' <span>업데이트 내역</span>'+(badge?'<span class="tag">'+badge+'</span>':'')+'</button>';
+}
+function updateNotice(ui) {
+  if(!ui.updates.unreadRemote)return '';
+  return '<div class="update-notice" role="status"><div><b>NyoruMemory '+e(ui.updates.state.remote.latest)+' 업데이트</b><small>새 버전의 변경 내용을 확인할 수 있어요.</small></div><button type="button" data-update-open>내용 보기</button><button type="button" class="subtle" data-update-dismiss aria-label="이 버전 알림 닫기">닫기</button></div>';
+}
+function bindLinks(ui,root) {
+  for(const button of root.querySelectorAll('[data-update-open]'))button.onclick=()=>act(ui,()=>openUpdates(ui));
+  for(const button of root.querySelectorAll('[data-update-dismiss]'))button.onclick=()=>act(ui,()=>ui.updates.acknowledge(ui.updates.state.remote?.latest));
+}
+function repaintUpdates(ui) {
+  if(ui.app.disposed)return;
+  const box=ui.doc.getElementById('nyoru-update-notice'),foot=ui.doc.getElementById('nyoru-update-footer');
+  if(box){box.innerHTML=updateNotice(ui);bindLinks(ui,box);}
+  if(foot){foot.innerHTML=updateFooter(ui);bindLinks(ui,foot);}
+  const dialog=ui.doc.getElementById('nyoru-updates-dialog');
+  if(dialog)renderDialog(ui,dialog);
+}
+function bindUpdates(ui){bindLinks(ui,ui.doc);}
+async function onUpdatesOpen(ui) {
+  const opening=(ui.updateOpening||0)+1;ui.updateOpening=opening;
+  await ui.updates.load();
+  if(ui.app.disposed||!ui.visible||opening!==ui.updateOpening||!ui.doc.getElementById('nyoru-update-footer'))return;
+  repaintUpdates(ui);
+  if(ui.updates.unseenInstalled)await openUpdates(ui);
+  void ui.updates.check().catch(()=>{});
+}
+function status(ui) {
+  const u=ui.updates;
+  if(u.status==='checking')return '최신 버전을 확인하고 있습니다…';
+  if(u.status==='error')return u.error;
+  if(!u.state.remote)return '아직 최신 버전을 확인하지 않았습니다.';
+  if(u.available)return '새 버전 '+u.state.remote.latest+'을 사용할 수 있습니다.';
+  return compare(VERSION,u.state.remote.latest)>0?'설치된 버전이 현재 공개 버전보다 새 버전입니다.':'현재 공개된 최신 버전입니다.';
+}
+function renderDialog(ui,dialog) {
+  const u=ui.updates,scroll=dialog.querySelector('.update-dialog-body')?.scrollTop||0,first=!dialog.renderedOnce;
+  const expanded=new Set([...dialog.querySelectorAll('details[open]')].map(row=>row.dataset.version));
+  const focus=ui.doc.activeElement?.dataset?.updateControl;
+  dialog.seenLatest=u.available?u.state.remote.latest:null;
+  dialog.innerHTML='<header class="update-dialog-head"><div><small>NyoruMemory · 설치된 버전 '+e(VERSION)+'</small><h2 id="nyoru-updates-title">업데이트 내역</h2></div></header>'
+    +'<div class="update-dialog-body"><div class="update-status"><p role="status">'+e(status(ui))+'</p><button type="button" data-update-check data-update-control="check" '+(u.status==='checking'?'disabled':'')+'>최신 버전 확인</button></div>'
+    +(u.state.checkedAt?'<small class="muted">마지막 확인 · '+e(new Date(u.state.checkedAt).toLocaleString('ko-KR'))+'</small>':'')
+    +(u.available?'<p class="update-install-help">RisuAI 설정 → 플러그인에서 NyoruMemory의 업데이트 버튼을 누른 뒤 새로 고침하세요.</p>':'')
+    +'<div class="update-log">'+u.entries.map((row,index)=>'<details class="update-entry" data-version="'+e(row.version)+'" '+(expanded.has(row.version)||(first&&(index===0||row.version===VERSION))?'open':'')+'><summary><span><b>v'+e(row.version)+'</b> '+e(row.title||'변경 내역')+'</span><small>'+e(row.version===VERSION?'설치됨':compare(row.version,VERSION)>0?'새 버전':row.date)+'</small></summary><ul>'+row.changes.map(text=>'<li>'+e(text)+'</li>').join('')+'</ul>'+(row.note?'<p class="update-entry-note">'+e(row.note)+'</p>':'')+'</details>').join('')+'</div></div>'
+    +'<footer class="update-dialog-foot"><label class="update-auto"><input type="checkbox" data-update-auto data-update-control="auto" '+(u.state.autoCheck?'checked':'')+'>창을 열 때 새 버전 자동 확인</label><small class="muted">자동 확인은 최대 6시간에 한 번입니다. 설치는 직접 선택합니다.</small>'
+    +(u.saveError?'<p role="status" class="muted">'+e(u.saveError)+'</p>':'')+'<div class="row update-dialog-actions"><button type="button" class="subtle" data-update-close data-update-control="close">닫기</button><button type="button" class="primary" data-update-close data-update-control="done">확인했어요</button></div></footer>';
+  dialog.querySelector('.update-dialog-body').scrollTop=scroll;dialog.renderedOnce=true;
+  for(const b of dialog.querySelectorAll('[data-update-close]'))b.onclick=()=>dialog.close();
+  dialog.querySelector('[data-update-check]').onclick=()=>act(ui,()=>u.check({force:true}));
+  dialog.querySelector('[data-update-auto]').onchange=event=>act(ui,async()=>{const enabled=event.target.checked;await u.setAutoCheck(enabled);if(enabled)void u.check().catch(()=>{});});
+  if(focus)dialog.querySelector('[data-update-control="'+focus+'"]')?.focus({preventScroll:true});
+}
+async function openUpdates(ui) {
+  await ui.updates.load();
+  if(ui.app.disposed)return;
+  const existing=ui.doc.getElementById('nyoru-updates-dialog');
+  if(existing){existing.focus();return;}
+  const previous=ui.doc.activeElement,dialog=ui.doc.createElement('dialog');
+  dialog.id='nyoru-updates-dialog';dialog.className='update-dialog';dialog.setAttribute('aria-labelledby','nyoru-updates-title');
+  renderDialog(ui,dialog);ui.doc.body.append(dialog);dialog.showModal();
+  dialog.addEventListener('close',()=>{
+    dialog.remove();
+    if(previous?.isConnected)previous.focus({preventScroll:true});
+    if (!ui.app.disposed) void ui.updates.acknowledge(dialog.seenLatest).catch(()=>{});
+  },{once:true});
+}
+
+
+return { updateFooter, updateNotice, repaintUpdates, bindUpdates, onUpdatesOpen, openUpdates };
+})();
+__modules["update-style.js"] = (() => {
+const UPDATE_CSS = `
+#nyoru-update-footer{margin-top:28px;padding-top:16px;border-top:1px solid var(--border)}
+.update-link{display:inline-flex;align-items:center;flex-wrap:wrap;gap:8px;font-size:12px}.update-link>span:first-child{color:var(--accent)}
+.update-link .tag{padding:2px 7px;border:1px solid var(--accent-border);border-radius:6px;background:var(--accent-bg);color:var(--accent)}
+.update-notice{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:18px;padding:14px 16px;border:1px solid var(--accent-border);border-radius:12px;background:var(--accent-bg)}
+.update-notice>div{flex:1;min-width:180px}.update-notice small{display:block;margin-top:3px;color:var(--muted)}
+.update-dialog{width:min(660px,calc(100vw - 24px));max-width:calc(100vw - 24px);max-height:calc(100vh - 32px);max-height:calc(100dvh - 32px);margin:auto;padding:0;border:1px solid var(--border-strong);border-radius:16px;background:var(--panel);color:var(--text);box-shadow:0 18px 60px var(--shadow);overflow:hidden}
+.update-dialog[open]{display:flex;flex-direction:column}.update-dialog::backdrop{background:var(--overlay)}
+.update-dialog-head{padding:20px 22px 16px;border-bottom:1px solid var(--border);flex-shrink:0}.update-dialog-head h2{margin:5px 0 0;font-size:21px}.update-dialog-head small{color:var(--muted)}
+.update-dialog-body{display:flex;flex-direction:column;min-height:0;padding:16px 22px;overflow:auto;overscroll-behavior:contain}
+.update-status{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}.update-status p{flex:1;min-width:160px;margin:0;font-size:13px}.update-status button{flex-shrink:0}
+.update-install-help{margin:12px 0 0;padding:12px;border-radius:9px;background:var(--accent-bg);font-size:13px}
+.update-log{flex-shrink:0;margin-top:18px}.update-entry{padding:12px 0;border-top:1px solid var(--border)}
+.update-entry summary{display:flex;align-items:baseline;justify-content:space-between;gap:12px;list-style:none;cursor:pointer}.update-entry summary::-webkit-details-marker{display:none}
+.update-entry summary>span::before{content:'▸';display:inline-block;width:18px;color:var(--accent)}.update-entry[open] summary>span::before{content:'▾'}
+.update-entry summary small{flex-shrink:0;color:var(--muted);font-size:11px}.update-entry ul{margin:8px 0 12px;padding-left:22px;font-size:13px;line-height:1.8}.update-entry li+li{margin-top:6px}
+.update-entry-note{margin:8px 0 0;padding:12px;border-radius:9px;background:var(--accent-bg);font-size:12px;line-height:1.75}
+.update-dialog-foot{display:flex;flex-direction:column;gap:8px;flex-shrink:0;margin:0;padding:14px 22px calc(16px + env(safe-area-inset-bottom));border-top:1px solid var(--border);background:var(--surface);text-align:left}
+.update-auto{display:flex;align-items:center;gap:8px;margin:0;font-size:13px}.update-auto input{width:auto;flex-shrink:0;margin:0}.update-dialog-foot>small{font-size:11px}.update-dialog-foot>p{margin:0;font-size:12px}.update-dialog-actions{justify-content:flex-end}
+@media(max-width:600px){.update-dialog-head,.update-dialog-body,.update-dialog-foot{padding-left:16px;padding-right:16px}.update-entry summary{align-items:flex-start;flex-direction:column;gap:3px}.update-entry summary small{padding-left:18px}.update-dialog-actions>button{flex:1}}
+`;
+
+return { UPDATE_CSS };
+})();
 __modules["ui-style.js"] = (() => {
 const UI_CSS = `
 :root{
@@ -5314,6 +5548,10 @@ function mergeText(record) { const s=contactInfo(record); return [contactAwarene
 return { CLEANUP_CSS, openCleanup };
 })();
 __modules["ui.js"] = (() => {
+const { UpdateNotices } = __modules["update-notices.js"];
+const { VERSION } = __modules["update-notes.js"];
+const { updateFooter, updateNotice, bindUpdates, onUpdatesOpen, repaintUpdates } = __modules["update-ui.js"];
+const { UPDATE_CSS } = __modules["update-style.js"];
 const { contactInfo, contactAwareness, CONTACT_BASES, CONTACT_LEVELS } = __modules["relationship-rules.js"];
 const { UI_CSS } = __modules["ui-style.js"];
 const { openReview, REVIEW_CSS } = __modules["review-ui.js"];
@@ -5343,11 +5581,13 @@ class UI {
   constructor(app, document) {
     this.app = app; this.doc = document; this.page = 'memory'; this.kind = 'events'; this.query = ''; this.offset = 0; this.connectionStatus = {}; this.noticeTimer = null; this.localBusy = false; this.visible = false;
     this.memoryFolds = new Map();
+    this.updates = new UpdateNotices(app);
+    this.updates.onChange = () => repaintUpdates(this);
     this.doc.documentElement.dataset.theme = this.app.theme || 'dark';
     this.doc.head.insertAdjacentHTML('beforeend', `<style>${UI_CSS}\n${SETTINGS_CSS}\n${MEMORY_EDITOR_CSS}
-${REVIEW_CSS}\n${CLEANUP_CSS}</style>`);
+${REVIEW_CSS}\n${CLEANUP_CSS}\n${UPDATE_CSS}</style>`);
   }
-  async open() { await this.app.api.showContainer('fullscreen'); this.visible = true; await this.refresh(); }
+  async open() { await this.app.api.showContainer('fullscreen'); this.visible = true; await this.refresh(); void onUpdatesOpen(this).catch(error => this.note(error.message)); }
   async refresh() {
     await this.app.syncCapacity();
     this.scope = null;
@@ -5383,7 +5623,10 @@ ${REVIEW_CSS}\n${CLEANUP_CSS}</style>`);
     const busy = this.localBusy || (this.scope && this.app.pipeline.busy(this.scope));
     const count = state ? processedIndexes(state).size : 0;
     const pending = this.data ? pendingMessages(state, this.data.snapshot.messages, this.app.settings).length : 0;
-    this.doc.body.innerHTML = `<div class="shell">${this.sidebar()}<main class="content">${this.header(count)}${this.scopeError ? `<div class="banner error">${escapeHTML(this.scopeError)}</div>` : ''}${this.app.lastError ? `<div class="banner error" role="alert">${escapeHTML(this.app.lastError)} <button id="dismiss" class="subtle">닫기</button></div>` : ''}${busy ? '<aside class="processing-dock" aria-label="기억 처리 진행"><div class="processing" role="status"><span class="dot"></span> ' + processingText + ' <button id="cancel">요청 취소</button></div></aside>' : ''}${this.page === 'memory' ? this.memoryPage(view, pending, busy) : this.page === 'chunks' ? this.chunksPage(state, busy) : this.page === 'settings' ? this.settingsPage() : this.backupPage()}</main></div>`;
+    const shell = `<div class="shell">${this.sidebar()}<main class="content">${this.header(count)}<div id="nyoru-update-notice">${updateNotice(this)}</div>${this.scopeError ? `<div class="banner error">${escapeHTML(this.scopeError)}</div>` : ''}${this.app.lastError ? `<div class="banner error" role="alert">${escapeHTML(this.app.lastError)} <button id="dismiss" class="subtle">닫기</button></div>` : ''}${busy ? '<aside class="processing-dock" aria-label="기억 처리 진행"><div class="processing" role="status"><span class="dot"></span> ' + processingText + ' <button id="cancel">요청 취소</button></div></aside>' : ''}${this.page === 'memory' ? this.memoryPage(view, pending, busy) : this.page === 'chunks' ? this.chunksPage(state, busy) : this.page === 'settings' ? this.settingsPage() : this.backupPage()}<footer id="nyoru-update-footer">${updateFooter(this)}</footer></main></div>`;
+    // Keep native dialogs connected during progress and navigation repaint.
+    this.doc.querySelector('.shell')?.remove();
+    this.doc.body.insertAdjacentHTML('afterbegin', shell);
     this.renderProgress();
     this.bind();
     this.doc.querySelectorAll('details').forEach(el => { if (openDetails.has(el.dataset.details || el.querySelector('summary')?.textContent)) el.open = true; });
@@ -5401,7 +5644,7 @@ ${REVIEW_CSS}\n${CLEANUP_CSS}</style>`);
     if (overlay?.contains(focused)) focused.focus({ preventScroll: true });
   }
   sidebar() {
-    return `<aside class="sidebar"><div class="sidebar-brand"><div class="brand"><span>◈</span> NyoruMemory</div><div class="version">0.25.1</div></div><nav class="nav" aria-label="주 메뉴">${[['memory', '기억 보관함'], ['chunks', '처리 기록'], ['settings', '모델 및 설정'], ['backup', '백업 및 수동 추출']].map(([id, label]) => `<button data-page="${id}" class="${this.page === id ? 'active' : ''}">${label}</button>`).join('')}</nav><div class="theme-picker" role="group" aria-label="화면 테마">${[['light', '☀', '라이트'], ['dark', '☾', '다크']].map(([id, icon, label]) => `<button type="button" data-theme-choice="${id}" aria-label="${label} 모드" aria-pressed="${(this.app.theme || 'dark') === id}" ${this.themeSaving ? 'disabled' : ''}><span aria-hidden="true">${icon}</span>${label}</button>`).join('')}</div></aside>`;
+    return `<aside class="sidebar"><div class="sidebar-brand"><div class="brand"><span>◈</span> NyoruMemory</div><div class="version">${VERSION}</div></div><nav class="nav" aria-label="주 메뉴">${[['memory', '기억 보관함'], ['chunks', '처리 기록'], ['settings', '모델 및 설정'], ['backup', '백업 및 수동 추출']].map(([id, label]) => `<button data-page="${id}" class="${this.page === id ? 'active' : ''}">${label}</button>`).join('')}</nav><div class="theme-picker" role="group" aria-label="화면 테마">${[['light', '☀', '라이트'], ['dark', '☾', '다크']].map(([id, icon, label]) => `<button type="button" data-theme-choice="${id}" aria-label="${label} 모드" aria-pressed="${(this.app.theme || 'dark') === id}" ${this.themeSaving ? 'disabled' : ''}><span aria-hidden="true">${icon}</span>${label}</button>`).join('')}</div></aside>`;
   }
   header(count) {
     return `<header class="top"><div class="context-block"><h1 class="chat-context"><span class="bot-name">${escapeHTML(this.data?.snapshot.charName || '채팅을 선택하세요')}</span>${this.data?.snapshot.chatName ? `<span class="context-divider" aria-hidden="true">/</span><span class="chat-name">${escapeHTML(this.data.snapshot.chatName)}</span>` : ''}</h1><div class="context-status"><span>${count.toLocaleString()}개 메시지 처리</span><span>${this.app.settings.autoProcess ? '자동 처리 켜짐' : '자동 처리 꺼짐'}</span>${this.app.settings.earlyRelationships ? '<span>사실·관계 묶음 갱신 켜짐</span>' : ''}</div></div><div class="row top-actions"><button id="refresh" class="subtle">새로 고침</button><button id="close" class="subtle" aria-label="닫기">닫기</button></div></header>`;
@@ -5517,6 +5760,7 @@ ${REVIEW_CSS}\n${CLEANUP_CSS}</style>`);
     return `<section class="panel"><h2>이 채팅의 기억 백업</h2><p class="muted">대화 묶음 원문, 네 종류의 기억, 모든 수정 이력과 실패 상태를 JSON으로 내보냅니다. 같은 캐릭터·채팅 ID의 백업만 복원합니다. 복원 직전 상태도 별도로 보관합니다.</p><div class="row"><button id="export" class="primary" ${this.scope ? '' : 'disabled'}>백업 다운로드</button><button id="restore" ${this.scope ? '' : 'disabled'}>JSON 백업 복원</button><button id="undo-restore" ${this.scope ? '' : 'disabled'}>직전 복원 되돌리기</button></div></section><section class="panel"><h2>연결 없이 수동 추출</h2><p class="muted">같은 대화 묶음과 추출 프롬프트를 복사하여 직접 AI에 전달한 뒤 결과 JSON을 붙여넣습니다. 자동 호출과 동일한 스키마·원문·동일성 검사를 적용합니다. AI 확인이 켜져 있으면 결과 저장 시 확인용 모델 연결이 필요합니다.</p><div class="row"><button id="manual-prompt" ${this.scope ? '' : 'disabled'}>추출 프롬프트 만들기</button><button id="manual-result" ${this.scope ? '' : 'disabled'}>추출 결과 붙여넣기</button></div></section>`;
   }
   bind() {
+    bindUpdates(this);
     this.doc.querySelectorAll('[data-memory-toggle]').forEach(button => button.addEventListener('click', () => {
       const state = this.foldState(), key = button.dataset.memoryToggle;
       state.overrides.set(key, !(state.overrides.get(key) ?? state.expanded));
@@ -5542,7 +5786,7 @@ ${REVIEW_CSS}\n${CLEANUP_CSS}</style>`);
     this.doc.querySelectorAll('[data-theme-choice]').forEach(button => button.addEventListener('click', () => { void this.changeTheme(button.dataset.themeChoice); }));
     this.doc.querySelectorAll('[data-page]').forEach(el => el.addEventListener('click', () => { this.page = el.dataset.page; this.render(); }));
     this.doc.querySelectorAll('[data-kind]').forEach(el => el.addEventListener('click', () => { this.kind = el.dataset.kind; this.offset = 0; this.render(); }));
-    on('refresh', () => this.action(async () => { this.app.lastError = ''; })); on('close', () => { this.closeModal(); this.visible = false; void this.app.api.hideContainer(); });
+    on('refresh', () => this.action(async () => { this.app.lastError = ''; })); on('close', () => { this.closeModal(); this.doc.getElementById('nyoru-updates-dialog')?.close(); this.visible = false; void this.app.api.hideContainer(); });
     on('dismiss', () => { this.app.lastError = ''; this.render(); }); on('cancel', () => { if (this.scope) this.app.pipeline.cancel(this.scope); this.stopDrain = true; this.connectionController?.abort(); });
     on('review-memory', () => this.action(() => openReview(this), false));
     this.doc.querySelectorAll('[data-cleanup]').forEach(el=>el.addEventListener('click',()=>this.action(()=>openCleanup(this,el.dataset.cleanup),false)));
@@ -5811,8 +6055,9 @@ ${REVIEW_CSS}\n${CLEANUP_CSS}</style>`);
     });
   }
   download(text) { const blob = new Blob([text], { type: 'application/json' }), url = URL.createObjectURL(blob); const a = this.doc.createElement('a'); a.href = url; a.download = `NyoruMemory-${new Date().toISOString().slice(0, 10)}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 30000); }
-  dispose() { this.closeModal(); this.visible = false; clearTimeout(this.noticeTimer); this.connectionController?.abort(); }
+  dispose() { this.updates.dispose(); this.doc.querySelector('#nyoru-updates-dialog')?.remove(); this.closeModal(); this.visible = false; clearTimeout(this.noticeTimer); this.connectionController?.abort(); }
 }
+
 
 return { escapeHTML, UI };
 })();
