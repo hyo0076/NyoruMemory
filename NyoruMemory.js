@@ -1,6 +1,6 @@
 //@name longmemory
-//@display-name NyoruMemory v0.27.1
-//@version 0.27.1
+//@display-name NyoruMemory v0.27.2
+//@version 0.27.2
 //@update-url https://raw.githubusercontent.com/hyo0076/NyoruMemory/main/NyoruMemory.js
 //@api 3.0
 (async () => {
@@ -983,16 +983,23 @@ const { uid } = __modules["state.js"];
 const { byteSize, redactDiagnostic } = __modules["diagnostics.js"];
 
 class RecoveryStore {
-  constructor(storage) { this.storage = storage; this.queues = new Map(); }
+  constructor(storage) { this.storage = storage; this.queues = storage.recoveryQueues ||= new Map(); }
   key(scope) { return this.storage.key(scope) + ':recovery'; }
   async list(scope) { await this.queues.get(this.key(scope)); return clone(await this.storage.api.getItem(this.key(scope)) || []); }
   async get(scope, id) { const row = (await this.list(scope)).find(r => r.id === id); assert(row, '복구 초안을 찾지 못했습니다.'); return row; }
-  async write(scope, row) {
+  async mutate(scope, id, change, create = false) {
     const key = this.key(scope);
     const work = (this.queues.get(key) || Promise.resolve()).catch(() => {}).then(async () => {
-      const stored = await this.storage.api.getItem(key) || [], old=stored.find(r=>r.id===row.id);
-      const rows = stored.filter(r => r.id !== row.id && r.updatedAt > Date.now() - 30 * 86400000);
-      const saved = { ...clone(row), expectedRevision:Math.max(old?.expectedRevision || 0,row.expectedRevision || 0), ...(old?.stale?{stale:true}:{}), updatedAt: Date.now() };
+      const stored = await this.storage.api.getItem(key) || [], old=stored.find(r=>r.id===id);
+      assert(old || create, '복구 초안을 찾지 못했습니다.');
+      // Read the latest row INSIDE the shared queue. A revision-only update must
+      // never write its pre-response snapshot over a newly arrived response.
+      const patch = typeof change === 'function' ? change(clone(old)) : change;
+      const rows = stored.filter(r => r.id !== id && r.updatedAt > Date.now() - 30 * 86400000);
+      const saved = { ...clone(old || {}), ...clone(patch), id, expectedRevision:Math.max(old?.expectedRevision || 0,patch.expectedRevision || 0), ...(old?.stale?{stale:true}:{}), updatedAt: Date.now() };
+      // The original response/HTTP envelope are append-once for this request.
+      for(const field of ['rawResponse','responseEnvelope']) if(old?.[field]?.length) saved[field]=old[field];
+      if(old?.appliedCommitId){saved.appliedCommitId=old.appliedCommitId;saved.status='applied';}
       assert(byteSize(saved) <= 16 * 1024 * 1024, '복구 자료가 16MiB를 넘습니다. 이 작업의 원문은 처리 기록에 보관됩니다.');
       rows.push(saved);
       while (rows.length > 40 || byteSize(rows) > 32 * 1024 * 1024) rows.shift();
@@ -1001,14 +1008,17 @@ class RecoveryStore {
     this.queues.set(key, work);
     try { return await work; } finally { if (this.queues.get(key) === work) this.queues.delete(key); }
   }
+  async write(scope, row) { return this.mutate(scope,row.id,row,true); }
+  async patch(scope, id, changes) { return this.mutate(scope,id,changes); }
   async begin(scope, details, secrets = []) {
     return this.write(scope, { format: 'nyorumemory-recovery-v1', id: uid(), scope: clone(scope), createdAt: Date.now(), appliedCommitId: null, status: 'requesting', rawResponse: '', draftText: '', ...redactDiagnostic(details, secrets) });
   }
   async draft(scope, id, text) {
     assert(typeof text === 'string', '편집 내용을 읽지 못했습니다. 기존 초안을 유지합니다.');
-    const row = await this.get(scope, id);
-    assert(!row.appliedCommitId && !['applied', 'repaired'].includes(row.status), '이미 적용한 복구 초안입니다.');
-    return this.write(scope, { ...row, draftText: text });
+    return this.patch(scope,id,row=>{
+      assert(!row.appliedCommitId && !['applied', 'repaired'].includes(row.status), '이미 적용한 복구 초안입니다.');
+      return {draftText:text};
+    });
   }
 }
 
@@ -1045,7 +1055,7 @@ class Storage {
       if (changed) {
         await this.save(state);
         const recovery = new RecoveryStore(this);
-        for(const row of await recovery.list(scope)) if(interrupted.has(row.chunkId)&&!row.stale&&row.expectedRevision===revision&&!row.appliedCommitId) await recovery.write(scope,{...row,expectedRevision:state.revision,status:'needs_repair',code:'INTERRUPTED',error:{message:'이전 실행이 중단되었습니다. 저장된 응답과 원문으로 복구할 수 있습니다.'}});
+        for(const row of await recovery.list(scope)) if(interrupted.has(row.chunkId)&&!row.stale&&row.expectedRevision===revision&&!row.appliedCommitId) await recovery.patch(scope,row.id,{expectedRevision:state.revision,status:'needs_repair',code:'INTERRUPTED',error:{message:'이전 실행이 중단되었습니다. 저장된 응답과 원문으로 복구할 수 있습니다.'}});
       }
       this.recovered.add(this.key(scope));
     }
@@ -1838,8 +1848,15 @@ class DirectProvider {
       const response = await this.api.nativeFetch(request.url, { method: 'POST', headers: request.headers, body: serialized, signal: controller.signal, requestTimeoutMs: p.timeoutMs, logFetch: false });
       if (p.format === 'vertex' && response.status === 401) this.vertexAuth.invalidate(p);
       const raw = await response.text();
-      assert(!controller.signal.aborted, '요청이 취소되었습니다.');
+      // Keep the received bytes before parsing or cancellation checks. Recovery
+      // persistence is independent of bounded/optional diagnostic logging.
       if (metadata.diagnostics) await log({ httpStatus: response.status, rawResponse: raw, elapsedMs: Date.now() - start });
+      let receivedText='';try{receivedText=modelResponseText(JSON.parse(raw),metadata.purpose);}catch{}
+      if(metadata.onResponse) {
+        try { await metadata.onResponse({raw,text:receivedText,httpStatus:response.status}); }
+        catch(error) { error.responseEnvelope=raw;error.responseText=receivedText;throw error; }
+      }
+      assert(!controller.signal.aborted, '요청이 취소되었습니다.');
       let data; try { data = JSON.parse(raw); } catch { throw new Error(`HTTP ${response.status}: JSON 응답이 아닙니다. 엔드포인트와 API 형식을 확인하세요.`); }
       if (!response.ok || data.error) {
         const detail = data.error?.message || (typeof data.error === 'string' ? data.error : data.message) || response.statusText || '요청 실패';
@@ -2508,15 +2525,32 @@ const { modelResponseText } = __modules["direct-provider.js"];
 async function loadRecoveryResponse(pipeline, scope, id) {
   let row = await pipeline.recovery.get(scope,id);
   if (row.draftText?.trim()) return row;
-  let text = row.rawResponse || '';
+  const envelopeText=raw=>{
+    if(typeof raw!=='string'||!raw.trim())return '';
+    try {
+      const data=JSON.parse(raw), text=modelResponseText(data,row.task);
+      if(text?.trim())return text;
+      if(data.schemaVersion===2&&['events','facts','relationships','plots'].some(k=>Array.isArray(data[k])))return raw;
+      return typeof data.output_text==='string'?data.output_text:'';
+    }catch{return '';}
+  };
+  let text = row.rawResponse || envelopeText(row.responseEnvelope), restoredFrom='saved-response';
   if (!text.trim()) {
-    const trace = (await pipeline.diagnostics.export(scope)).traces.find(t=>t.id===row.requestId);
-    text = trace?.responseText || '';
-    if (!text.trim() && (row.responseEnvelope || trace?.rawResponse)) {
-      try { text=modelResponseText(JSON.parse(row.responseEnvelope || trace.rawResponse)); } catch { /* Preserve the envelope for inspection. */ }
+    const traces=(await pipeline.diagnostics.export(scope)).traces;
+    const candidates=traces.filter(t=>t.id===row.requestId || t.chunkId===row.chunkId&&t.jobId===row.jobId&&t.purpose===row.task);
+    for(const trace of candidates.reverse()){
+      text=trace.responseText || envelopeText(trace.rawResponse);
+      if(text?.trim()){restoredFrom='diagnostic:'+trace.id;break;}
     }
   }
-  if (text.trim()) row=await pipeline.recovery.write(scope,{...row,rawResponse:row.rawResponse||text,draftText:text});
+  if(!text?.trim()) {
+    const siblings=(await pipeline.recovery.list(scope)).filter(r=>r.id!==id&&r.chunkId===row.chunkId&&r.task===row.task&&r.sourceDigest===row.sourceDigest&&r.fingerprint===row.fingerprint);
+    for(const r of siblings.reverse()){
+      text=r.draftText || r.rawResponse || envelopeText(r.responseEnvelope);
+      if(text?.trim()){restoredFrom='same-input-request:'+r.requestId;break;}
+    }
+  }
+  if (text?.trim()) row=await pipeline.recovery.patch(scope,row.id,current=>current.draftText?.trim()?{}:{rawResponse:current.rawResponse||text,draftText:text,restoredFrom});
   return row;
 }
 
@@ -2527,9 +2561,14 @@ async function captureModelRequest(pipeline, scope, prepared, task, messages, pr
   let row = await pipeline.recovery.begin(scope, { chunkId: prepared.chunk.id, jobId: prepared.chunk.id + ':' + prepared.chunk.attempts, task, stage: 'request_model', expectedRevision: prepared.state.revision, sourceDigest: prepared.sourceDigest || await sourceDigest(prepared.chunk.messages), fingerprint: prepared.fingerprint || await extractionFingerprint(prepared.state, prepared.chunk, settings), requestId: traceId, request: messages, source: prepared.chunk.messages, context }, secrets);
   try {
     for(const id of messages.jevTraceIds||[]) await pipeline.diagnostics.update(scope,id,{generationSkipped:false,generationRequestId:traceId,reason:'참고 자료만 선별 · 기존 모델로 추출'});
-    const text = await pipeline.provider.chat(messages, profile, signal, { diagnostics: pipeline.diagnostics, scope, traceId, purpose: task });
+    const text = await pipeline.provider.chat(messages, profile, signal, { diagnostics: pipeline.diagnostics, scope, traceId, purpose: task,
+      onResponse: async receipt => {
+        const responseText=redactDiagnostic(receipt.text || '',secrets);
+        row=await pipeline.recovery.patch(scope,row.id,current=>({responseEnvelope:redactDiagnostic(receipt.raw,secrets),httpStatus:receipt.httpStatus,responseReceivedAt:Date.now(),...(responseText?{rawResponse:responseText,...(!current.draftText?{draftText:responseText}:{})}:{})}));
+      }
+    });
     // Persist BEFORE parsing, including responses that arrived just as cancel was pressed.
-    row = await pipeline.recovery.write(scope, { ...row, stage: 'parse_model_output', status: 'needs_repair', rawResponse: redactDiagnostic(text, secrets), draftText: redactDiagnostic(text, secrets) });
+    row = await pipeline.recovery.patch(scope, row.id, { stage: 'parse_model_output', status: 'needs_repair', rawResponse: redactDiagnostic(text, secrets), draftText: redactDiagnostic(text, secrets) });
     assert(!signal?.aborted, '요청이 취소되었습니다.');
     let parsed;
     try { parsed = parseModelJSON(text); }
@@ -2538,7 +2577,7 @@ async function captureModelRequest(pipeline, scope, prepared, task, messages, pr
       if(signal?.aborted) throw error;
       try {
         const fixed=await repairJSONText(pipeline,scope,row,text,signal);
-        row=await pipeline.recovery.write(scope,{...row,draftText:redactDiagnostic(fixed.text,secrets),formatRepair:fixed.method});
+        row=await pipeline.recovery.patch(scope,row.id,{draftText:redactDiagnostic(fixed.text,secrets),formatRepair:fixed.method});
         parsed=parseModelJSON(fixed.text);
       } catch(repairError) {
         error.message += '\n형식 복구도 완료하지 못했습니다. 보관한 응답의 오류 위치에서 이어서 고칠 수 있습니다. '+repairError.message;
@@ -2547,15 +2586,16 @@ async function captureModelRequest(pipeline, scope, prepared, task, messages, pr
     }
     row.stage = 'validate_model_output';
     const result = await resolve(parsed);
-    await pipeline.recovery.write(scope, { ...row, status: 'validated' });
+    await pipeline.recovery.patch(scope, row.id, { stage:'validate_model_output', status: 'validated' });
     await pipeline.diagnostics.update(scope, traceId, { status: 'validated', responseText: text }, secrets);
     return result;
   } catch (error) {
     const safe = redactDiagnostic(error.message, secrets);
-    if(error.responseText) row = { ...row, rawResponse:redactDiagnostic(error.responseText,secrets), draftText:redactDiagnostic(error.responseText,secrets), stage:'provider_output' };
-    if(error.responseEnvelope) row.responseEnvelope=redactDiagnostic(error.responseEnvelope,secrets);
+    const received={};
+    if(error.responseText) Object.assign(received,{ rawResponse:redactDiagnostic(error.responseText,secrets), draftText:redactDiagnostic(error.responseText,secrets), stage:'provider_output' });
+    if(error.responseEnvelope) received.responseEnvelope=redactDiagnostic(error.responseEnvelope,secrets);
     const position=/position (\d+)/u.exec(safe);
-    await pipeline.recovery.write(scope, { ...row, status: 'needs_repair', code: error.code || (signal?.aborted ? 'CANCELLED' : 'MODEL_RESPONSE_FAILED'), error: { message: safe, position:position?Number(position[1]):null } });
+    await pipeline.recovery.patch(scope, row.id, { ...received, status: 'needs_repair', code: error.code || (signal?.aborted ? 'CANCELLED' : 'MODEL_RESPONSE_FAILED'), error: { message: safe, position:position?Number(position[1]):null } });
     await pipeline.diagnostics.update(scope, traceId, { status: 'failed', stage: row.stage, error: safe, code: error.code || null }, secrets);
     throw error;
   }
@@ -2564,8 +2604,11 @@ async function captureModelRequest(pipeline, scope, prepared, task, messages, pr
 async function settleRecovery(pipeline, scope, chunkId, preparedRevision, state, commitId = null) {
   try {
   for (const row of await pipeline.recovery.list(scope)) if (row.chunkId === chunkId && !['applied','repaired'].includes(row.status)) {
-    const compatible = row.expectedRevision <= preparedRevision && state.revision === preparedRevision + 1;
-    await pipeline.recovery.write(scope, { ...row, ...(compatible ? { expectedRevision: state.revision } : { stale: true }), ...(commitId ? { status: 'applied', appliedCommitId: commitId } : {}) });
+    await pipeline.recovery.patch(scope,row.id,current=>{
+      if(['applied','repaired'].includes(current.status))return {};
+      const compatible=current.expectedRevision===state.revision || current.expectedRevision<=preparedRevision&&state.revision===preparedRevision+1;
+      return {...(compatible?{expectedRevision:state.revision}:{stale:true}),...(commitId?{status:'applied',appliedCommitId:commitId}:{})};
+    });
     if(commitId) await pipeline.diagnostics.update(scope,row.requestId,{status:'applied',commitId});
   }
   } catch(error) {
@@ -2645,7 +2688,7 @@ async function resumeRecovery(pipeline, scope, id, text) {
           await pipeline.storage.save(state);
           await settleRecovery(pipeline, scope, chunk.id, row.expectedRevision, state);
         });
-        await pipeline.recovery.write(scope, { ...await pipeline.recovery.get(scope,id), draftText: text, status: 'repaired' });
+        await pipeline.recovery.patch(scope, id, { draftText: text, status: 'repaired' });
         await pipeline.diagnostics.update(scope,row.requestId,{ recovery: { status:'part_repaired', missing, reusedKinds: Object.keys(draft.results).filter(k=>k!==row.task), generationSkipped:true, reason:'선택한 실패 작업만 수정; 다른 실패 작업은 대기' } });
         return { partial: true, missing };
       }
@@ -3382,7 +3425,7 @@ class Pipeline {
         const row = (await this.recovery.list(scope)).filter(r=>r.chunkId===prepared.chunk.id&&r.task===kind).at(-1);
         if(row?.status==='validated') {
           const details={stage:'prepare_or_checkpoint',error:{message:redactDiagnostic(String(error.message).slice(0,2000),profileSecrets(settings.extractor))}};
-          await this.recovery.write(scope,{...row,...details,status:'needs_repair',code:'CHECKPOINT_FAILED'});
+          await this.recovery.patch(scope,row.id,{...details,status:'needs_repair',code:'CHECKPOINT_FAILED'});
           await this.diagnostics.update(scope,row.requestId,{...details,status:'failed'});
         }
       },
@@ -4125,11 +4168,17 @@ return { RisuHost, ContextBridge };
 })();
 __modules["update-notes.js"] = (() => {
 // Public release feed and offline change log. Keep this independent of memory data.
-const VERSION = '0.27.1';
+const VERSION = '0.27.2';
 const UPDATE_NOTES = {
   latest: VERSION,
   entries: [
-    { version: VERSION, date: '2026-10-09', title: 'JSON 형식 복구 · 중단 상태 표시', changes: [
+    { version: VERSION, date: '2026-10-09', title: '복구 응답이 빈 사본으로 덮이는 저장 경로 수정', changes: [
+      '병렬 작업의 상태 갱신이 저장된 응답과 수정 초안을 덮어쓰지 않도록, 최신 기록에서 변경 필드만 갱신합니다.',
+      'API 응답을 받은 즉시 원본과 본문을 복구 기록에 보관하며, 원본은 해당 요청에서 한 번 저장한 뒤 변경하지 않습니다.',
+      '비어 있는 기록은 연결된 진단 자료와 입력 조건이 같은 이전 요청에서도 본문을 찾습니다.',
+      '응답이 실제로 남아 있지 않으면 빈 편집창 대신 실패 단계와 실제 오류를 표시합니다. 재시도 실패 이유가 일반 안내로 가려지던 문제도 수정했습니다.'
+    ], note: '사용자 요청에 따라 테스트 없이 빌드·배포합니다. 이미 모든 보관 자료에서 사라진 응답을 복원할 수는 없습니다.' },
+    { version: '0.27.1', date: '2026-10-09', title: 'JSON 형식 복구 · 중단 상태 표시', changes: [
       'AI 응답의 불필요한 쉼표·작은따옴표·따옴표 없는 키·주석을 코드에서 정리합니다. 해결되지 않으면 오류 주변만 한 번 요청합니다.',
       '복구창에 보관한 응답을 불러오고 오류 행·열과 주변 내용을 표시합니다. 빈 응답은 적용하지 않습니다.',
       '형식만 빠르게 고치기와 선택한 항목만 다시 요청하기를 추가했습니다. 성공한 다른 종류의 결과는 유지합니다.',
@@ -6272,28 +6321,34 @@ const tasks={events:'내용·대사',facts:'사실',relationships:'관계',plots
 const stages={request_model:'모델 요청',parse_model_output:'JSON 읽기',validate_model_output:'내용 검사',provider_output:'모델 출력 확인'};
 async function openRecovery(ui, chunkId) {
   const scope = await ui.requireScope(), store = ui.app.pipeline.recovery;
-  const rows = [...new Map((await store.list(scope)).filter(r=>r.chunkId===chunkId && !['applied','repaired'].includes(r.status)).map(r=>[r.task,r])).values()];
+  const rows = [...new Map((await store.list(scope)).filter(r=>r.chunkId===chunkId && !['applied','repaired'].includes(r.status)).sort((a,b)=>a.createdAt-b.createdAt).map(r=>[r.task,r])).values()];
   if (!rows.length) { ui.note('이전 버전에서 실패한 응답은 보관되어 있지 않습니다. AI로 재시도하면 다음 실패부터 복구 초안이 남습니다.'); return; }
-  let row = [...rows].reverse().find(r=>r.status==='needs_repair') || rows.at(-1), busy = false;
+  let row = [...rows].reverse().find(r=>r.status==='needs_repair') || rows.at(-1), busy = false, manualEntry = false;
   row=await loadRecoveryResponse(ui.app.pipeline,scope,row.id);
   const root = ui.modal('실패 작업 복구', `<p class="muted small">원문은 유지합니다. 선택한 작업만 수정하며, 조건이 같은 성공 결과는 재사용합니다. 저장 전 AI 검수가 켜져 있으면 적용할 때 검수 모델을 호출합니다.<br>복구 초안은 최근 40건 · 30일 · 총 32MiB까지 별도 보관합니다.</p><label>복구할 작업<select id="recovery-task">${rows.map(r=>`<option value="${esc(r.id)}" ${r.id===row.id?'selected':''}>${esc(tasks[r.task]||r.task)} · ${esc(stages[r.stage]||r.stage)} · ${r.status==='validated'?'검사 완료 초안':'수정 필요'}</option>`).join('')}</select></label><p id="recovery-detail" class="small"></p><div class="row"><button data-recovery-save>초안 보관</button><button data-recovery-apply class="primary">검사 후 적용</button></div><textarea id="recovery-text" spellcheck="false" aria-label="복구 초안" style="min-height:40vh"></textarea><p id="recovery-error" class="error" role="alert"></p><details><summary>실패한 응답 / 원문</summary><pre id="recovery-original" style="white-space:pre-wrap;max-height:24vh;overflow:auto"></pre></details><div class="row"><button data-recovery-save>초안 보관</button><button id="recovery-review">뉴뉴에게 수정 요청</button><button id="recovery-export">오류 내보내기</button><button data-recovery-apply class="primary">검사 후 적용</button></div><p class="muted small">오류 내보내기에는 원문·AI 응답이 포함됩니다. 공유 전에 확인하세요.</p>`);
   const input=root.querySelector('#recovery-text'), error=root.querySelector('#recovery-error');
   input.insertAdjacentHTML('beforebegin','<div class="row"><button id="recovery-fast" class="primary">형식만 빠르게 고치기</button><button id="recovery-jump">오류 위치로 이동</button><button id="recovery-retry">이 항목만 다시 요청</button></div><p class="small muted">빠른 복구는 쉼표·따옴표를 먼저 정리합니다. 필요할 때만 오류 주변 최대 3,200자를 AI에 한 번 보냅니다. 대화 원문이나 전체 기억은 보내지 않습니다.</p><pre id="recovery-location" style="white-space:pre-wrap;max-height:10em;overflow:auto"></pre>');
+  input.insertAdjacentHTML('beforebegin','<div id="recovery-empty" class="banner error" hidden><strong>저장된 응답을 복원하지 못했습니다.</strong><p>아래에 실제 실패 사유를 표시합니다. 현재 요청의 진단 기록과 같은 입력의 이전 응답도 확인했지만, 편집할 본문을 찾지 못했습니다.</p><p>이 항목만 다시 요청하면 새 응답을 보관합니다. 이미 성공한 다른 항목을 다시 만들지는 않습니다.</p><button id="recovery-paste">직접 받은 응답 붙여넣기</button></div>');
   const locate=()=>{
     const text=input.value;
     root.querySelectorAll('[data-recovery-apply],#recovery-fast,#recovery-review').forEach(b=>b.disabled=busy||!text.trim());
-    if(!text.trim()){error.textContent='이 요청에서 복구할 AI 응답 본문을 찾지 못했습니다. 빈 내용은 적용하지 않습니다. ‘이 항목만 다시 요청’을 누르면 성공한 다른 항목은 유지합니다.';root.querySelector('#recovery-location').textContent='보관된 응답 본문 없음';return null;}
+    input.style.display=text.trim()||manualEntry?'':'none';
+    root.querySelector('#recovery-empty').hidden=Boolean(text.trim());
+    root.querySelector('#recovery-jump').disabled=busy||!text.trim();
+    root.querySelectorAll('[data-recovery-save]').forEach(b=>b.disabled=busy||!text.trim());
+    if(!text.trim()){root.querySelector('#recovery-location').textContent=`실패 단계: ${stages[row.stage]||row.stage} · HTTP: ${row.httpStatus??'미기록'} · 응답 수신: ${row.responseReceivedAt?'기록 있음':row.responseEnvelope?'원본 보관됨':'미기록'}`;return null;}
     let problem;try{parseModelJSON(text);}catch(e){problem=e;}
     const point=jsonErrorLocation(text,problem||row.error?.message);
     root.querySelector('#recovery-location').textContent=problem?`${point.line}행 ${point.column}열\n${point.excerpt}`:'JSON 형식은 읽을 수 있습니다. 적용할 때 내용·근거·원문 변경 여부를 확인합니다.';
     return point;
   };
   ui.placeModalClose(root, root.querySelector('#recovery-review'));
-  const display=()=>{ input.value=row.draftText || row.rawResponse || ''; error.textContent=row.error?.message || ''; root.querySelector('#recovery-detail').textContent=`작업 ${row.jobId} · 요청 ${row.requestId}`; root.querySelector('#recovery-original').textContent=JSON.stringify({rawResponse:row.rawResponse,responseEnvelope:row.responseEnvelope,source:row.source},null,2); locate(); };
+  const display=()=>{ input.value=row.draftText || row.rawResponse || ''; manualEntry=false;error.textContent=row.error?.message || ''; root.querySelector('#recovery-detail').textContent=`작업 ${row.jobId} · 요청 ${row.requestId}${row.restoredFrom?' · 보관 자료에서 본문 복원':''}`; root.querySelector('#recovery-original').textContent=JSON.stringify({rawResponse:row.rawResponse,responseEnvelope:row.responseEnvelope,source:row.source},null,2); locate(); };
   const run=async fn=>{ if(busy)return; busy=true; root.querySelectorAll('button,textarea,select').forEach(e=>e.disabled=true); try{await fn();}catch(e){error.textContent=e.message;}finally{busy=false;root.querySelectorAll('button,textarea,select').forEach(e=>e.disabled=false);locate();} };
   root.addEventListener('keydown',e=>{if(busy&&e.key==='Escape')e.stopImmediatePropagation();},true);
   root.querySelector('#recovery-task').onchange=()=>run(async()=>{ await store.draft(scope,row.id,input.value); row=await loadRecoveryResponse(ui.app.pipeline,scope,root.querySelector('#recovery-task').value); display(); });
   input.oninput=()=>{error.textContent='';locate();};
+  root.querySelector('#recovery-paste').onclick=()=>{manualEntry=true;locate();input.focus();};
   root.querySelector('#recovery-jump').onclick=()=>{const p=locate();if(p){input.focus();input.setSelectionRange(p.position,Math.min(input.value.length,p.position+1));input.scrollTop=Math.max(0,(p.line-3)*20);}};
   root.querySelector('#recovery-fast').onclick=()=>run(async()=>{
     const pipeline=ui.app.pipeline;if(pipeline.busy(scope))throw new Error('다른 작업이 진행 중입니다.');
@@ -6301,7 +6356,18 @@ async function openRecovery(ui, chunkId) {
     error.textContent='오류 위치의 JSON 형식만 수정 중입니다…';
     try{const fixed=await repairJSONText(pipeline,scope,row,input.value,controller.signal);row=await store.draft(scope,row.id,fixed.text);input.value=fixed.text;error.textContent=fixed.calls?'오류 주변 수정안을 보관했습니다. 아래 위치를 확인하고 검사 후 적용하세요.':'API 호출 없이 형식을 정리했습니다. 검사 후 적용을 누르세요.';}finally{pipeline.jobs.delete(pipeline.key(scope));}
   });
-  root.querySelector('#recovery-retry').onclick=()=>run(async()=>{error.textContent='선택한 항목만 다시 요청 중입니다…';await retryRecoveryTask(ui.app.pipeline,scope,row.id);root.remove();await ui.refresh();ui.note('선택한 항목을 다시 처리했습니다.');});
+  root.querySelector('#recovery-retry').onclick=()=>run(async()=>{
+    error.textContent='선택한 항목만 다시 요청 중입니다…';
+    try{const result=await retryRecoveryTask(ui.app.pipeline,scope,row.id);root.remove();await ui.refresh();ui.note(result.partial?'선택한 항목은 복구했습니다. 다른 미완료 항목은 처리 기록에서 확인하세요.':'선택한 항목을 다시 처리했습니다.');}
+    catch(e){
+      // A new attempt may have failed after receiving text. Show THAT receipt,
+      // and never replace its actionable error with a generic empty-input hint.
+      const latest=(await store.list(scope)).filter(r=>r.chunkId===chunkId&&r.task===row.task&&!['applied','repaired'].includes(r.status)).sort((a,b)=>a.createdAt-b.createdAt).at(-1);
+      row=await loadRecoveryResponse(ui.app.pipeline,scope,latest?.id||row.id);
+      const select=root.querySelector('#recovery-task');if(![...select.options].some(o=>o.value===row.id))select.insertAdjacentHTML('beforeend',`<option value="${esc(row.id)}">${esc(tasks[row.task]||row.task)} · 최근 재시도</option>`);select.value=row.id;
+      display();throw e;
+    }
+  });
   root.querySelectorAll('[data-recovery-save]').forEach(b=>b.onclick=()=>run(async()=>{ row=await store.draft(scope,row.id,input.value); error.textContent='초안을 보관했습니다. 아직 기억에는 적용하지 않았습니다.'; }));
   root.querySelectorAll('[data-recovery-apply]').forEach(b=>b.onclick=()=>run(async()=>{
     await store.draft(scope,row.id,input.value);
