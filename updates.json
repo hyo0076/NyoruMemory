@@ -1,6 +1,17 @@
 {
-  "latest": "0.27.2",
+  "latest": "0.27.3",
   "entries": [
+    {
+      "version": "0.27.3",
+      "date": "2026-10-15",
+      "title": "GitHub Copilot 모델 연결 수정",
+      "changes": [
+        "GitHub Copilot의 공식 API 주소를 자동 인식해 Copilot-Integration-Id와 클라이언트 호환 헤더를 보냅니다. 기존 주소·모델 설정을 그대로 사용할 수 있습니다.",
+        "Copilot으로 연결한 Gemini·Claude 모델에는 출력 한도를 max_tokens로 보냅니다.",
+        "모델 요청이 거절되면 요청한 모델과 보낸 연결 ID·서버 연결 ID를 표시해 JSON 복구 오류와 구분합니다. 직접 지정한 추가 헤더는 우선 적용됩니다."
+      ],
+      "note": "공개 0.27.2 기반의 연결 수정본입니다. 로컬 Jev 관찰 실험은 포함하지 않았습니다. 사용자 요청에 따라 테스트·실제 AI 호출 없이 배포합니다."
+    },
     {
       "version": "0.27.2",
       "date": "2026-10-09",

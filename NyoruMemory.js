@@ -1,6 +1,6 @@
 //@name longmemory
-//@display-name NyoruMemory v0.27.2
-//@version 0.27.2
+//@display-name NyoruMemory v0.27.3
+//@version 0.27.3
 //@update-url https://raw.githubusercontent.com/hyo0076/NyoruMemory/main/NyoruMemory.js
 //@api 3.0
 (async () => {
@@ -1715,10 +1715,39 @@ function truncatedOutput() {
   throw error;
 }
 
+// Copilot routes models by integration ID. Omitting it can select a different
+// model catalogue even when the API URL and model name are otherwise correct.
+function isCopilotEndpoint(endpoint) {
+  try {
+    const url = new URL(endpoint);
+    return url.protocol === 'https:' && !url.port &&
+      /^(?:api|api\.(?:individual|business|enterprise))\.githubcopilot\.com$/iu.test(url.hostname);
+  } catch { return false; }
+}
+function copilotHeaders(endpoint, format) {
+  if (!format.startsWith('openai-') || !isCopilotEndpoint(endpoint)) return {};
+  return {
+    'copilot-integration-id': 'vscode-chat',
+    'editor-version': 'vscode/1.136.1',
+    'openai-intent': 'conversation-panel'
+  };
+}
+function requestError(status, detail, profile, request) {
+  const error = new Error(`HTTP ${status}: ${detail}`);
+  if (isCopilotEndpoint(request.url) && /requested model is not available|model[_ ]not[_ ]found|model[^\n]*not supported/iu.test(String(detail))) {
+    const sent = request.headers['copilot-integration-id'] || '(없음)';
+    const received = String(detail).match(/integrator\s+["']([^"']+)["']/iu)?.[1];
+    error.code = 'MODEL_UNAVAILABLE';
+    error.message = `HTTP ${status}: Copilot이 모델 “${profile.model}” 요청을 거절했습니다. 보낸 연결 ID: ${sent}${received ? ` · 서버 연결 ID: ${received}` : ''}. ` +
+      '기억이나 JSON 문제가 아닙니다. 모델 및 설정에서 모델 ID와 추가 HTTP 헤더를 확인하세요. ' + String(detail);
+  }
+  return error;
+}
+
 function buildRequest(messages, profile) {
   const p = validateProfile(profile, true), url = resolveEndpoint(p);
   assert(Array.isArray(messages) && messages.length && messages.every(m => ['system', 'user', 'assistant'].includes(m.role) && typeof m.content === 'string'), 'Memory AI 메시지 형식 오류');
-  const headers = { 'content-type': 'application/json' }, extra = clone(p.extraBody);
+  const headers = { 'content-type': 'application/json', ...copilotHeaders(url, p.format) }, extra = clone(p.extraBody);
   // NyoruMemory uses JSON messages, never provider-side executable tools.
   for (const key of ['tools', 'tool_choice', 'functions', 'function_call', 'toolConfig']) delete extra[key];
   let body;
@@ -1726,7 +1755,9 @@ function buildRequest(messages, profile) {
     if (p.apiKey) headers.authorization = `Bearer ${p.apiKey}`;
     body = { ...(p.format === 'openai-responses' ? { store: false } : {}), ...extra, model: p.model, stream: false };
     if (p.format === 'openai-chat') {
-      body.messages = clone(messages); body[p.tokenParameter] = p.maxOutputTokens;
+      body.messages = clone(messages);
+      const tokenParameter = isCopilotEndpoint(url) && /^(?:gemini|claude)-/iu.test(p.model) ? 'max_tokens' : p.tokenParameter;
+      body[tokenParameter] = p.maxOutputTokens;
       if (p.reasoningEffort) body.reasoning_effort = p.reasoningEffort;
       if (p.jsonMode) body.response_format = { type: 'json_object' };
     } else {
@@ -1844,7 +1875,7 @@ class DirectProvider {
       if (pdf) assert(new TextEncoder().encode(serialized).byteLength <= PDF_MAX_REQUEST_BYTES, 'PDF 요청이 20MB를 넘습니다. 한 번에 정리할 메시지 수를 줄여주세요.');
       if (p.format === 'vertex') { accessToken = await this.vertexAuth.token(p, controller.signal); request.headers.authorization = `Bearer ${accessToken}`; }
       assert(!controller.signal.aborted, '요청이 취소되었습니다.');
-      if (metadata.diagnostics) await log({ networkRequest: true, model: p.model, request: { url: request.url, body }, inputBytes: new TextEncoder().encode(serialized).length });
+      if (metadata.diagnostics) await log({ networkRequest: true, model: p.model, request: { url: request.url, body }, ...(isCopilotEndpoint(request.url) ? { copilotRouting: { integrationId: request.headers['copilot-integration-id'], editorVersion: request.headers['editor-version'] } } : {}), inputBytes: new TextEncoder().encode(serialized).length });
       const response = await this.api.nativeFetch(request.url, { method: 'POST', headers: request.headers, body: serialized, signal: controller.signal, requestTimeoutMs: p.timeoutMs, logFetch: false });
       if (p.format === 'vertex' && response.status === 401) this.vertexAuth.invalidate(p);
       const raw = await response.text();
@@ -1860,7 +1891,7 @@ class DirectProvider {
       let data; try { data = JSON.parse(raw); } catch { throw new Error(`HTTP ${response.status}: JSON 응답이 아닙니다. 엔드포인트와 API 형식을 확인하세요.`); }
       if (!response.ok || data.error) {
         const detail = data.error?.message || (typeof data.error === 'string' ? data.error : data.message) || response.statusText || '요청 실패';
-        throw new Error(`HTTP ${response.status}: ${detail}`);
+        throw requestError(response.status, detail, p, request);
       }
       assert(!controller.signal.aborted, '요청이 취소되었습니다.');
       if (metadata.diagnostics) await log({ usage: data.usage ?? data.usageMetadata ?? null, status: 'responded' });
@@ -4168,11 +4199,16 @@ return { RisuHost, ContextBridge };
 })();
 __modules["update-notes.js"] = (() => {
 // Public release feed and offline change log. Keep this independent of memory data.
-const VERSION = '0.27.2';
+const VERSION = '0.27.3';
 const UPDATE_NOTES = {
   latest: VERSION,
   entries: [
-    { version: VERSION, date: '2026-10-09', title: '복구 응답이 빈 사본으로 덮이는 저장 경로 수정', changes: [
+    { version: VERSION, date: '2026-10-15', title: 'GitHub Copilot 모델 연결 수정', changes: [
+      'GitHub Copilot의 공식 API 주소를 자동 인식해 Copilot-Integration-Id와 클라이언트 호환 헤더를 보냅니다. 기존 주소·모델 설정을 그대로 사용할 수 있습니다.',
+      'Copilot으로 연결한 Gemini·Claude 모델에는 출력 한도를 max_tokens로 보냅니다.',
+      '모델 요청이 거절되면 요청한 모델과 보낸 연결 ID·서버 연결 ID를 표시해 JSON 복구 오류와 구분합니다. 직접 지정한 추가 헤더는 우선 적용됩니다.'
+    ], note: '공개 0.27.2 기반의 연결 수정본입니다. 로컬 Jev 관찰 실험은 포함하지 않았습니다. 사용자 요청에 따라 테스트·실제 AI 호출 없이 배포합니다.' },
+    { version: '0.27.2', date: '2026-10-09', title: '복구 응답이 빈 사본으로 덮이는 저장 경로 수정', changes: [
       '병렬 작업의 상태 갱신이 저장된 응답과 수정 초안을 덮어쓰지 않도록, 최신 기록에서 변경 필드만 갱신합니다.',
       'API 응답을 받은 즉시 원본과 본문을 복구 기록에 보관하며, 원본은 해당 요청에서 한 번 저장한 뒤 변경하지 않습니다.',
       '비어 있는 기록은 연결된 진단 자료와 입력 조건이 같은 이전 요청에서도 본문을 찾습니다.',
